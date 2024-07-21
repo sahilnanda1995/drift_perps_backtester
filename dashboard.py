@@ -52,15 +52,18 @@ def calculate_fees_and_profits(funding_rates, price_data, position_size, leverag
     open_fee = position_size * leverage * 0.001 * fee_discount  # 0.1% open fee with potential discount
     close_fee = position_size * leverage * 0.001 * fee_discount  # 0.1% close fee with potential discount
     
-    if margin_direction == "Long":
-        total_variable_fee = funding_rates['fundingRate'].sum() * position_size * leverage
-    else:  # Short
-        total_variable_fee = -funding_rates['fundingRate'].sum() * position_size * leverage
+    # Align funding rates with price data
+    aligned_data = pd.merge(price_data, funding_rates, left_index=True, right_on='ts', how='inner')
     
+    hourly_fees = aligned_data['fundingRate'] * position_size * leverage
+    if margin_direction == "Short":
+        hourly_fees = -hourly_fees
+    
+    total_variable_fee = hourly_fees.sum()
     total_fee = open_fee + close_fee + total_variable_fee
     
-    initial_price = price_data['close'].iloc[0]
-    final_price = price_data['close'].iloc[-1]
+    initial_price = aligned_data['close'].iloc[0]
+    final_price = aligned_data['close'].iloc[-1]
     price_change = (final_price - initial_price) / initial_price
     
     hodl_profit = position_size * price_change
@@ -69,7 +72,17 @@ def calculate_fees_and_profits(funding_rates, price_data, position_size, leverag
     if margin_direction == "Short":
         leverage_profit = -leverage_profit
     
-    return open_fee, close_fee, total_variable_fee, total_fee, hodl_profit, leverage_profit
+    # Calculate hourly account balance
+    hourly_pnl = position_size * leverage * aligned_data['close'].pct_change().fillna(0)
+    if margin_direction == "Short":
+        hourly_pnl = -hourly_pnl
+    
+    account_balance = pd.Series(index=aligned_data.index, data=position_size)
+    for i in range(1, len(account_balance)):
+        account_balance.iloc[i] = account_balance.iloc[i-1] + hourly_pnl.iloc[i] - hourly_fees.iloc[i]
+    
+    return open_fee, close_fee, total_variable_fee, total_fee, hodl_profit, leverage_profit, hourly_fees, account_balance, aligned_data.index
+
 
 # Main app logic
 def main():
@@ -105,9 +118,11 @@ def main():
     st.header("Fee Simulation and Profit Comparison")
 
     comparison_data = []
+    hourly_fees_data = pd.DataFrame()
+    account_balance_data = pd.DataFrame()
 
     for leverage in selected_leverages:
-        open_fee, close_fee, total_variable_fee, total_fee, hodl_profit, leverage_profit = calculate_fees_and_profits(
+        open_fee, close_fee, total_variable_fee, total_fee, hodl_profit, leverage_profit, hourly_fees, account_balance, aligned_index = calculate_fees_and_profits(
             funding_rates_filtered, price_data, position_size, leverage, margin_direction, token
         )
         
@@ -119,6 +134,9 @@ def main():
             'Total Fee': total_fee,
             'Profit': leverage_profit
         })
+
+        hourly_fees_data[f'{leverage}x'] = hourly_fees
+        account_balance_data[f'{leverage}x'] = account_balance
 
     comparison_df = pd.DataFrame(comparison_data)
     st.table(comparison_df.set_index('Leverage'))
@@ -136,6 +154,17 @@ def main():
                                title=f"Fee Breakdown for Different Leverage ({token})",
                                barmode='stack')
     st.plotly_chart(fig_fee_breakdown, use_container_width=True)
+
+    # Hourly Fees Paid Chart
+    st.header("Hourly Fees Paid")
+    fig_hourly_fees = px.line(hourly_fees_data, x=aligned_index, y=hourly_fees_data.columns,
+                              title=f"Hourly Fees Paid for Different Leverage ({token})")
+    st.plotly_chart(fig_hourly_fees, use_container_width=True)
+
+    # Account Balance Chart
+    fig_account_balance = px.line(account_balance_data, x=aligned_index, y=account_balance_data.columns,
+                                  title=f"Account Balance Simulation for Different Leverage ({token})")
+    st.plotly_chart(fig_account_balance, use_container_width=True)
 
     # HODL vs All Leverage Strategies Profit Comparison
     st.header("HODL vs All Leverage Strategies Profit Comparison")

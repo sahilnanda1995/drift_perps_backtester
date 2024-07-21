@@ -46,43 +46,69 @@ def fetch_price_data(token, start_date, end_date):
     })
     return df
 
-# Calculate fees and profits
-def calculate_fees_and_profits(funding_rates, price_data, position_size, leverage, margin_direction, token):
-    fee_discount = 0.25 if token in ['SOL', 'ETH', 'BTC'] else 1
-    open_fee = position_size * leverage * 0.001 * fee_discount  # 0.1% open fee with potential discount
-    close_fee = position_size * leverage * 0.001 * fee_discount  # 0.1% close fee with potential discount
-    
-    # Align funding rates with price data
-    aligned_data = pd.merge(price_data, funding_rates, left_index=True, right_on='ts', how='inner')
-    
-    hourly_fees = aligned_data['fundingRate'] * position_size * leverage
-    if margin_direction == "Short":
-        hourly_fees = -hourly_fees
-    
-    total_variable_fee = hourly_fees.sum()
-    total_fee = open_fee + close_fee + total_variable_fee
-    
-    initial_price = aligned_data['close'].iloc[0]
-    final_price = aligned_data['close'].iloc[-1]
-    price_change = (final_price - initial_price) / initial_price
-    
-    hodl_profit = position_size * price_change
-    leverage_profit = (position_size * leverage * price_change) - total_fee
-    
-    if margin_direction == "Short":
-        leverage_profit = -leverage_profit
-    
-    # Calculate hourly account balance
-    hourly_pnl = position_size * leverage * aligned_data['close'].pct_change().fillna(0)
-    if margin_direction == "Short":
-        hourly_pnl = -hourly_pnl
-    
-    account_balance = pd.Series(index=aligned_data.index, data=position_size)
-    for i in range(1, len(account_balance)):
-        account_balance.iloc[i] = account_balance.iloc[i-1] + hourly_pnl.iloc[i] - hourly_fees.iloc[i]
-    
-    return open_fee, close_fee, total_variable_fee, total_fee, hodl_profit, leverage_profit, hourly_fees, account_balance, aligned_data.index
+# Preprocess funding rate data
+def preprocess_funding_rates(funding_rates):
+    funding_rates = funding_rates.sort_values('ts')
+    return funding_rates
 
+# Map funding rates to price data
+def map_funding_rates_to_price(funding_rates, price_data):
+    mapped_data = pd.merge_asof(price_data, funding_rates, left_on='timestamp', right_on='ts', direction='nearest')
+    return mapped_data
+
+# Calculate fees and profits
+def calculate_fees_and_profits(mapped_data, position_size, leverage, margin_direction, token):
+    fee_discount = 0.25 if token in ['SOL', 'ETH', 'BTC'] else 1
+    open_fee = position_size * leverage * 0.001 * fee_discount
+    close_fee = position_size * leverage * 0.001 * fee_discount
+
+    mapped_data['hourly_fee'] = mapped_data['fundingRate'] * position_size * leverage
+    if margin_direction == "Short":
+        mapped_data['hourly_fee'] = -mapped_data['hourly_fee']
+
+    mapped_data['cumulative_fee'] = mapped_data['hourly_fee'].cumsum() + open_fee
+    
+    mapped_data['price_change_pct'] = mapped_data['close'].pct_change()
+    mapped_data['hourly_pnl'] = position_size * leverage * mapped_data['price_change_pct']
+    if margin_direction == "Short":
+        mapped_data['hourly_pnl'] = -mapped_data['hourly_pnl']
+    
+    mapped_data['cumulative_pnl'] = mapped_data['hourly_pnl'].cumsum()
+    mapped_data['account_balance'] = position_size + mapped_data['cumulative_pnl'] - mapped_data['cumulative_fee']
+
+    # Calculate HODL profit
+    initial_price = mapped_data['close'].iloc[0]
+    final_price = mapped_data['close'].iloc[-1]
+    hodl_profit = position_size * (final_price - initial_price) / initial_price
+
+    return mapped_data, hodl_profit
+
+# Create fee chart
+def create_fee_chart(mapped_data):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=mapped_data['timestamp'], y=mapped_data['cumulative_fee'],
+                             mode='lines', name='Cumulative Fees'))
+    fig.update_layout(title='Cumulative Fees Over Time',
+                      xaxis_title='Time', yaxis_title='Cumulative Fees (USD)')
+    return fig
+
+# Create hourly fee chart
+def create_hourly_fee_chart(mapped_data):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=mapped_data['timestamp'], y=mapped_data['hourly_fee'],
+                             mode='lines', name='Hourly Fees'))
+    fig.update_layout(title='Hourly Fees Over Time',
+                      xaxis_title='Time', yaxis_title='Hourly Fees (USD)')
+    return fig
+
+# Create account balance chart
+def create_account_balance_chart(mapped_data):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=mapped_data['timestamp'], y=mapped_data['account_balance'],
+                             mode='lines', name='Account Balance'))
+    fig.update_layout(title='Account Balance Over Time',
+                      xaxis_title='Time', yaxis_title='Account Balance (USD)')
+    return fig
 
 # Main app logic
 def main():
@@ -101,90 +127,111 @@ def main():
         if st.sidebar.checkbox(f"{lev}x", value=True):
             selected_leverages.append(lev)
 
-    # Load data
+    # Load and preprocess data
     funding_rates = load_funding_rates(token)
+    funding_rates = preprocess_funding_rates(funding_rates)
     price_data = fetch_price_data(token, start_date, end_date)
     
-    # Filter data based on date range
-    mask = (funding_rates['ts'] >= pd.Timestamp(start_date)) & (funding_rates['ts'] <= pd.Timestamp(end_date))
-    funding_rates_filtered = funding_rates.loc[mask]
+    # Map funding rates to price data
+    mapped_data = map_funding_rates_to_price(funding_rates, price_data)
 
-    # Funding Rates Chart
-    st.header("Funding Rates")
-    fig_funding = px.line(funding_rates_filtered, x='ts', y='fundingRate', title=f"Funding Rates for {token}")
-    st.plotly_chart(fig_funding, use_container_width=True)
-
-    # Fee Simulation and Profit Comparison
-    st.header("Fee Simulation and Profit Comparison")
-
-    comparison_data = []
-    hourly_fees_data = pd.DataFrame()
-    account_balance_data = pd.DataFrame()
-
+    # Calculate fees and profits for each leverage
+    results = []
     for leverage in selected_leverages:
-        open_fee, close_fee, total_variable_fee, total_fee, hodl_profit, leverage_profit, hourly_fees, account_balance, aligned_index = calculate_fees_and_profits(
-            funding_rates_filtered, price_data, position_size, leverage, margin_direction, token
-        )
-        
-        comparison_data.append({
-            'Leverage': f'{leverage}x',
-            'Open Fee': open_fee,
-            'Close Fee': close_fee,
-            'Total Variable Fee': total_variable_fee,
-            'Total Fee': total_fee,
-            'Profit': leverage_profit
+        data, hodl_profit = calculate_fees_and_profits(mapped_data.copy(), position_size, leverage, margin_direction, token)
+        results.append({
+            'leverage': leverage,
+            'data': data,
+            'hodl_profit': hodl_profit
         })
 
-        hourly_fees_data[f'{leverage}x'] = hourly_fees
-        account_balance_data[f'{leverage}x'] = account_balance
+    # Display debug table
+    st.subheader("Debug Table")
+    if results:  # Check if results list is not empty
+        debug_df = results[0]['data'][['timestamp', 'close', 'fundingRate', 'hourly_fee', 'cumulative_fee', 'price_change_pct', 'hourly_pnl', 'cumulative_pnl', 'account_balance']]
+        st.dataframe(debug_df)
+    else:
+        st.write("No data to display. Please select at least one leverage option.")
 
-    comparison_df = pd.DataFrame(comparison_data)
-    st.table(comparison_df.set_index('Leverage'))
+    # Create and display new charts
+    if results:  # Check if results list is not empty
+        st.subheader("Fee Analysis")
+        fee_chart = go.Figure()
+        for result in results:
+            fee_chart.add_trace(go.Scatter(x=result['data']['timestamp'], y=result['data']['cumulative_fee'],
+                                           mode='lines', name=f'{result["leverage"]}x Leverage'))
+        fee_chart.update_layout(title='Cumulative Fees Over Time',
+                                xaxis_title='Time', yaxis_title='Cumulative Fees (USD)')
+        st.plotly_chart(fee_chart, use_container_width=True)
 
-    # Profit Comparison Chart
-    fig_profit_comparison = px.bar(comparison_df, x='Leverage', y='Profit', 
-                                   title=f"Profit Comparison for Different Leverage ({token})")
-    st.plotly_chart(fig_profit_comparison, use_container_width=True)
+        st.subheader("Hourly Fee Analysis")
+        hourly_fee_chart = go.Figure()
+        for result in results:
+            hourly_fee_chart.add_trace(go.Scatter(x=result['data']['timestamp'], y=result['data']['hourly_fee'],
+                                                  mode='lines', name=f'{result["leverage"]}x Leverage'))
+        hourly_fee_chart.update_layout(title='Hourly Fees Over Time',
+                                       xaxis_title='Time', yaxis_title='Hourly Fees (USD)')
+        st.plotly_chart(hourly_fee_chart, use_container_width=True)
 
-    # Fee Breakdown Chart
-    fee_breakdown = comparison_df.melt(id_vars=['Leverage'], 
-                                       value_vars=['Open Fee', 'Close Fee', 'Total Variable Fee'],
-                                       var_name='Fee Type', value_name='Amount')
-    fig_fee_breakdown = px.bar(fee_breakdown, x='Leverage', y='Amount', color='Fee Type', 
-                               title=f"Fee Breakdown for Different Leverage ({token})",
-                               barmode='stack')
-    st.plotly_chart(fig_fee_breakdown, use_container_width=True)
+        st.subheader("Account Balance Analysis")
+        balance_chart = go.Figure()
+        for result in results:
+            balance_chart.add_trace(go.Scatter(x=result['data']['timestamp'], y=result['data']['account_balance'],
+                                               mode='lines', name=f'{result["leverage"]}x Leverage'))
+        balance_chart.update_layout(title='Account Balance Over Time',
+                                    xaxis_title='Time', yaxis_title='Account Balance (USD)')
+        st.plotly_chart(balance_chart, use_container_width=True)
 
-    # Hourly Fees Paid Chart
-    st.header("Hourly Fees Paid")
-    fig_hourly_fees = px.line(hourly_fees_data, x=aligned_index, y=hourly_fees_data.columns,
-                              title=f"Hourly Fees Paid for Different Leverage ({token})")
-    st.plotly_chart(fig_hourly_fees, use_container_width=True)
+        # Funding Rates Chart
+        st.subheader("Funding Rates")
+        fig_funding = px.line(mapped_data, x='timestamp', y='fundingRate', title=f"Funding Rates for {token}")
+        st.plotly_chart(fig_funding, use_container_width=True)
 
-    # Account Balance Chart
-    fig_account_balance = px.line(account_balance_data, x=aligned_index, y=account_balance_data.columns,
-                                  title=f"Account Balance Simulation for Different Leverage ({token})")
-    st.plotly_chart(fig_account_balance, use_container_width=True)
+        # Fee Simulation and Profit Comparison
+        st.subheader("Fee Simulation and Profit Comparison")
 
-    # HODL vs All Leverage Strategies Profit Comparison
-    st.header("HODL vs All Leverage Strategies Profit Comparison")
-    hodl_comparison = pd.DataFrame({
-        'Strategy': ['HODL'] + [f'{lev}x' for lev in selected_leverages],
-        'Profit': [hodl_profit] + comparison_df['Profit'].tolist()
-    })
+        comparison_data = []
+        for result in results:
+            leverage = result['leverage']
+            data = result['data']
+            total_fee = data['cumulative_fee'].iloc[-1]
+            final_balance = data['account_balance'].iloc[-1]
+            profit = final_balance - position_size
 
-    fig_hodl_comparison = px.bar(hodl_comparison, x='Strategy', y='Profit', 
-                                 title=f"HODL vs All Leverage Strategies Profit Comparison for {token}")
-    st.plotly_chart(fig_hodl_comparison, use_container_width=True)
+            comparison_data.append({
+                'Leverage': f'{leverage}x',
+                'Total Fee': total_fee,
+                'Final Balance': final_balance,
+                'Profit': profit
+            })
+
+        comparison_df = pd.DataFrame(comparison_data)
+        st.table(comparison_df.set_index('Leverage'))
+
+        # Profit Comparison Chart
+        fig_profit_comparison = px.bar(comparison_df, x='Leverage', y='Profit', 
+                                       title=f"Profit Comparison for Different Leverage ({token})")
+        st.plotly_chart(fig_profit_comparison, use_container_width=True)
+
+        # HODL vs All Leverage Strategies Profit Comparison
+        st.subheader("HODL vs All Leverage Strategies Profit Comparison")
+        hodl_comparison = pd.DataFrame({
+            'Strategy': ['HODL'] + [f'{lev}x' for lev in selected_leverages],
+            'Profit': [results[0]['hodl_profit']] + comparison_df['Profit'].tolist()
+        })
+
+        fig_hodl_comparison = px.bar(hodl_comparison, x='Strategy', y='Profit', 
+                                     title=f"HODL vs All Leverage Strategies Profit Comparison for {token}")
+        st.plotly_chart(fig_hodl_comparison, use_container_width=True)
 
     # Price Chart
-    st.header("Price Chart")
+    st.subheader("Price Chart")
     fig_price = go.Figure()
-    fig_price.add_trace(go.Candlestick(x=price_data['timestamp'],
-                                       open=price_data['open'],
-                                       high=price_data['high'],
-                                       low=price_data['low'],
-                                       close=price_data['close'],
+    fig_price.add_trace(go.Candlestick(x=mapped_data['timestamp'],
+                                       open=mapped_data['open'],
+                                       high=mapped_data['high'],
+                                       low=mapped_data['low'],
+                                       close=mapped_data['close'],
                                        name='Price'))
     fig_price.update_layout(title=f"{token} Price", xaxis_title="Date", yaxis_title="Price (USD)")
     st.plotly_chart(fig_price, use_container_width=True)

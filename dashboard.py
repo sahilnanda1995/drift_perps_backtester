@@ -67,19 +67,6 @@ def map_funding_rates_to_price(funding_rates, price_data):
 
 # Calculate fees and profits
 def calculate_fees_and_profits(mapped_data, entry_amount, leverage, margin_direction, token):
-    """
-    Calculate fees and profits for a given trading scenario.
-
-    Args:
-    mapped_data (pd.DataFrame): DataFrame containing price and funding rate data
-    entry_amount (float): Initial investment amount in USD
-    leverage (float): Leverage used for the trade
-    margin_direction (str): 'Long' or 'Short'
-    token (str): Cryptocurrency token symbol
-
-    Returns:
-    tuple: (mapped_data, hodl_profit, open_fee, close_fee)
-    """
     fee_discount = 0.25 if token in ['SOL', 'ETH', 'BTC'] else 1
     initial_price = mapped_data['close'].iloc[0]
     final_price = mapped_data['close'].iloc[-1]
@@ -93,7 +80,8 @@ def calculate_fees_and_profits(mapped_data, entry_amount, leverage, margin_direc
     close_fee = final_position_value * 0.001 * fee_discount
 
     # Calculate hourly fees based on current token price
-    mapped_data['hourly_fee'] = mapped_data['fundingRate'] * initial_token_amount * mapped_data['close'] * leverage
+    # Convert funding rate from percentage to decimal
+    mapped_data['hourly_fee'] = (mapped_data['fundingRate'] / 100) * initial_token_amount * mapped_data['close'] * leverage
     if margin_direction == "Short":
         mapped_data['hourly_fee'] = -mapped_data['hourly_fee']
 
@@ -134,6 +122,15 @@ def create_hourly_fee_chart(results):
                                  mode='lines', name=f'{result["leverage"]}x Leverage'))
     fig.update_layout(title='Hourly Fees Over Time',
                       xaxis_title='Time', yaxis_title='Hourly Fees (USD)')
+    return fig
+
+# Create funding rate chart
+def create_funding_rate_chart(mapped_data):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=mapped_data['timestamp'], y=mapped_data['fundingRate'],
+                             mode='lines', name='Funding Rate'))
+    fig.update_layout(title='Funding Rates Over Time',
+                      xaxis_title='Time', yaxis_title='Funding Rate (%)')
     return fig
 
 # Create account balance chart
@@ -248,7 +245,7 @@ def main():
 
         # Funding Rates Chart
         st.subheader("Funding Rates")
-        fig_funding = px.line(mapped_data, x='timestamp', y='fundingRate', title=f"Funding Rates for {token}")
+        fig_funding = create_funding_rate_chart(mapped_data)
         st.plotly_chart(fig_funding, use_container_width=True)
 
         # Fee Simulation and Profit Comparison

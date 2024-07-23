@@ -1,10 +1,10 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
 from datetime import datetime, timedelta, date
-import json
 
 # Set page config
 st.set_page_config(page_title="Drift Protocol Fee Analysis", layout="wide")
@@ -12,61 +12,85 @@ st.set_page_config(page_title="Drift Protocol Fee Analysis", layout="wide")
 # Title
 st.title("Drift Protocol Fee and Profit Analysis")
 
-# Sidebar
-st.sidebar.header("Settings")
-
 # Load funding rate data
 @st.cache_data
 def load_funding_rates(token):
-    df = pd.read_csv(f"{token.lower()}.csv", sep=";")
-    df['ts'] = pd.to_datetime(df['ts'], format="%m/%d/%Y, %H:%M:%S")
-    return df
+    try:
+        df = pd.read_csv(f"{token.lower()}.csv", sep=";")
+        df['ts'] = pd.to_datetime(df['ts'], format="%m/%d/%Y, %H:%M:%S")
+        return df
+    except Exception as e:
+        st.error(f"Error loading funding rates for {token}: {e}")
+        return pd.DataFrame()
 
 # Fetch price data
 @st.cache_data
 def fetch_price_data(token, start_date, end_date):
-    start_datetime = datetime.combine(start_date, datetime.min.time())
-    end_datetime = datetime.combine(end_date, datetime.max.time())
-    
-    url = f"https://benchmarks.pyth.network/v1/shims/tradingview/history"
-    params = {
-        "symbol": f"Crypto.{token}/USD",
-        "resolution": "60",
-        "from": int(start_datetime.timestamp()),
-        "to": int(end_datetime.timestamp())
-    }
-    response = requests.get(url, params=params)
-    data = json.loads(response.text)
-    df = pd.DataFrame({
-        'timestamp': pd.to_datetime(data['t'], unit='s'),
-        'open': data['o'],
-        'high': data['h'],
-        'low': data['l'],
-        'close': data['c']
-    })
-    return df
+    try:
+        start_datetime = datetime.combine(start_date, datetime.min.time())
+        end_datetime = datetime.combine(end_date, datetime.max.time())
+        
+        url = f"https://benchmarks.pyth.network/v1/shims/tradingview/history"
+        params = {
+            "symbol": f"Crypto.{token}/USD",
+            "resolution": "60",
+            "from": int(start_datetime.timestamp()),
+            "to": int(end_datetime.timestamp())
+        }
+        response = requests.get(url, params=params)
+        response.raise_for_status()  # Raises an HTTPError for bad responses
+        data = response.json()
+        df = pd.DataFrame({
+            'timestamp': pd.to_datetime(data['t'], unit='s'),
+            'open': data['o'],
+            'high': data['h'],
+            'low': data['l'],
+            'close': data['c']
+        })
+        return df
+    except requests.RequestException as e:
+        st.error(f"Error fetching price data: {e}")
+        return pd.DataFrame()
+    except (KeyError, ValueError) as e:
+        st.error(f"Error processing price data: {e}")
+        return pd.DataFrame()
 
 # Preprocess funding rate data
+@st.cache_data
 def preprocess_funding_rates(funding_rates):
-    funding_rates = funding_rates.sort_values('ts')
-    return funding_rates
+    return funding_rates.sort_values('ts')
 
 # Map funding rates to price data
+@st.cache_data
 def map_funding_rates_to_price(funding_rates, price_data):
-    mapped_data = pd.merge_asof(price_data, funding_rates, left_on='timestamp', right_on='ts', direction='nearest')
-    return mapped_data
+    return pd.merge_asof(price_data, funding_rates, left_on='timestamp', right_on='ts', direction='nearest')
 
 # Calculate fees and profits
 def calculate_fees_and_profits(mapped_data, entry_amount, leverage, margin_direction, token):
+    """
+    Calculate fees and profits for a given trading scenario.
+
+    Args:
+    mapped_data (pd.DataFrame): DataFrame containing price and funding rate data
+    entry_amount (float): Initial investment amount in USD
+    leverage (float): Leverage used for the trade
+    margin_direction (str): 'Long' or 'Short'
+    token (str): Cryptocurrency token symbol
+
+    Returns:
+    tuple: (mapped_data, hodl_profit, open_fee, close_fee)
+    """
     fee_discount = 0.25 if token in ['SOL', 'ETH', 'BTC'] else 1
     initial_price = mapped_data['close'].iloc[0]
+    final_price = mapped_data['close'].iloc[-1]
     initial_token_amount = entry_amount / initial_price
 
     # Calculate open fee
     open_fee = entry_amount * leverage * 0.001 * fee_discount
     
-    # Calculate close fee (assuming it's the same as open fee)
-    close_fee = open_fee
+    # Calculate close fee based on final position value
+    final_position_value = entry_amount * leverage * (final_price / initial_price)
+    close_fee = final_position_value * 0.001 * fee_discount
 
     # Calculate hourly fees based on current token price
     mapped_data['hourly_fee'] = mapped_data['fundingRate'] * initial_token_amount * mapped_data['close'] * leverage
@@ -74,7 +98,10 @@ def calculate_fees_and_profits(mapped_data, entry_amount, leverage, margin_direc
         mapped_data['hourly_fee'] = -mapped_data['hourly_fee']
 
     mapped_data['cumulative_hourly_fee'] = mapped_data['hourly_fee'].cumsum()
+    
+    # Include close fee in total fee calculation at the last row
     mapped_data['total_fee'] = mapped_data['cumulative_hourly_fee'] + open_fee
+    mapped_data.loc[mapped_data.index[-1], 'total_fee'] += close_fee
 
     mapped_data['price_change_pct'] = mapped_data['close'].pct_change()
     mapped_data['hourly_pnl'] = entry_amount * leverage * mapped_data['price_change_pct']
@@ -85,37 +112,66 @@ def calculate_fees_and_profits(mapped_data, entry_amount, leverage, margin_direc
     mapped_data['account_balance'] = entry_amount + mapped_data['cumulative_pnl'] - mapped_data['total_fee']
 
     # Calculate HODL profit
-    final_price = mapped_data['close'].iloc[-1]
     hodl_profit = entry_amount * (final_price - initial_price) / initial_price
 
     return mapped_data, hodl_profit, open_fee, close_fee
 
 # Create fee chart
-def create_fee_chart(mapped_data):
+def create_fee_chart(results):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=mapped_data['timestamp'], y=mapped_data['total_fee'],
-                             mode='lines', name='Total Fees'))
+    for result in results:
+        fig.add_trace(go.Scatter(x=result['data']['timestamp'], y=result['data']['total_fee'],
+                                 mode='lines', name=f'{result["leverage"]}x Leverage'))
     fig.update_layout(title='Total Fees Over Time',
                       xaxis_title='Time', yaxis_title='Total Fees (USD)')
     return fig
 
 # Create hourly fee chart
-def create_hourly_fee_chart(mapped_data):
+def create_hourly_fee_chart(results):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=mapped_data['timestamp'], y=mapped_data['hourly_fee'],
-                             mode='lines', name='Hourly Fees'))
+    for result in results:
+        fig.add_trace(go.Scatter(x=result['data']['timestamp'], y=result['data']['hourly_fee'],
+                                 mode='lines', name=f'{result["leverage"]}x Leverage'))
     fig.update_layout(title='Hourly Fees Over Time',
                       xaxis_title='Time', yaxis_title='Hourly Fees (USD)')
     return fig
 
 # Create account balance chart
-def create_account_balance_chart(mapped_data):
+def create_account_balance_chart(results):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=mapped_data['timestamp'], y=mapped_data['account_balance'],
-                             mode='lines', name='Account Balance'))
+    for result in results:
+        fig.add_trace(go.Scatter(x=result['data']['timestamp'], y=result['data']['account_balance'],
+                                 mode='lines', name=f'{result["leverage"]}x Leverage'))
     fig.update_layout(title='Account Balance Over Time',
                       xaxis_title='Time', yaxis_title='Account Balance (USD)')
     return fig
+
+# Calculate Sharpe Ratio
+def calculate_sharpe_ratio(returns, risk_free_rate=0.02):
+    excess_returns = returns - risk_free_rate / 252  # Assuming 252 trading days in a year
+    return np.sqrt(252) * excess_returns.mean() / excess_returns.std()
+
+# Add Sharpe Ratio to results
+def add_sharpe_ratio(result):
+    data = result['data']
+    daily_returns = data['account_balance'].pct_change().dropna()
+    sharpe_ratio = calculate_sharpe_ratio(daily_returns)
+    return sharpe_ratio
+
+# Validate data
+def validate_data(mapped_data, start_date, end_date):
+    if mapped_data.empty:
+        st.error("No data available for the selected date range.")
+        return False
+    
+    data_start = mapped_data['timestamp'].min().date()
+    data_end = mapped_data['timestamp'].max().date()
+    
+    if data_start > start_date or data_end < end_date:
+        st.warning(f"Data only available from {data_start} to {data_end}. Adjusting date range.")
+        return False
+    
+    return True
 
 # Main app logic
 def main():
@@ -134,11 +190,16 @@ def main():
 
     # Leverage options
     leverage_options = [1.5, 2, 3, 4, 5, 6, 8, 10]
-    selected_leverages = []
-    st.sidebar.write("Select Leverage Options:")
-    for lev in leverage_options:
-        if st.sidebar.checkbox(f"{lev}x", value=True):
-            selected_leverages.append(lev)
+    use_custom_leverage = st.sidebar.checkbox("Use custom leverage")
+    if use_custom_leverage:
+        custom_leverage = st.sidebar.number_input("Enter custom leverage", min_value=1.0, max_value=20.0, value=1.5, step=0.1)
+        selected_leverages = [custom_leverage]
+    else:
+        selected_leverages = []
+        st.sidebar.write("Select Leverage Options:")
+        for lev in leverage_options:
+            if st.sidebar.checkbox(f"{lev}x", value=True):
+                selected_leverages.append(lev)
 
     # Load and preprocess data
     funding_rates = load_funding_rates(token)
@@ -147,6 +208,10 @@ def main():
     
     # Map funding rates to price data
     mapped_data = map_funding_rates_to_price(funding_rates, price_data)
+
+    # Validate data
+    if not validate_data(mapped_data, start_date, end_date):
+        st.stop()
 
     # Calculate fees and profits for each leverage
     results = []
@@ -160,33 +225,25 @@ def main():
             'close_fee': close_fee
         })
 
-    # Create and display new charts
-    if results:  # Check if results list is not empty
+    # Add Sharpe Ratio to results
+    for result in results:
+        result['sharpe_ratio'] = add_sharpe_ratio(result)
+
+    # Display charts
+    if results:
         st.subheader("Fee Analysis")
-        fee_chart = go.Figure()
-        for result in results:
-            fee_chart.add_trace(go.Scatter(x=result['data']['timestamp'], y=result['data']['total_fee'],
-                                           mode='lines', name=f'{result["leverage"]}x Leverage'))
-        fee_chart.update_layout(title='Total Fees Over Time',
-                                xaxis_title='Time', yaxis_title='Total Fees (USD)')
+        fee_chart = create_fee_chart(results)
         st.plotly_chart(fee_chart, use_container_width=True)
 
         st.subheader("Hourly Fee Analysis")
-        hourly_fee_chart = go.Figure()
-        for result in results:
-            hourly_fee_chart.add_trace(go.Scatter(x=result['data']['timestamp'], y=result['data']['hourly_fee'],
-                                                  mode='lines', name=f'{result["leverage"]}x Leverage'))
-        hourly_fee_chart.update_layout(title='Hourly Fees Over Time',
-                                       xaxis_title='Time', yaxis_title='Hourly Fees (USD)')
+        hourly_fee_chart = create_hourly_fee_chart(results)
         st.plotly_chart(hourly_fee_chart, use_container_width=True)
 
         st.subheader("Account Balance Analysis")
-        balance_chart = go.Figure()
-        for result in results:
-            balance_chart.add_trace(go.Scatter(x=result['data']['timestamp'], y=result['data']['account_balance'],
-                                               mode='lines', name=f'{result["leverage"]}x Leverage'))
-        balance_chart.update_layout(title='Account Balance Over Time',
-                                    xaxis_title='Time', yaxis_title='Account Balance (USD)')
+        use_log_scale = st.checkbox("Use logarithmic scale for Account Balance")
+        balance_chart = create_account_balance_chart(results)
+        if use_log_scale:
+            balance_chart.update_layout(yaxis_type="log")
         st.plotly_chart(balance_chart, use_container_width=True)
 
         # Funding Rates Chart
@@ -209,7 +266,8 @@ def main():
                 'Leverage': f'{leverage}x',
                 'Total Fee': total_fee,
                 'Final Balance': final_balance,
-                'Profit': profit
+                'Profit': profit,
+                'Sharpe Ratio': result['sharpe_ratio']
             })
 
         comparison_df = pd.DataFrame(comparison_data)
@@ -231,6 +289,12 @@ def main():
                                      title=f"HODL vs All Leverage Strategies Profit Comparison for {token}")
         st.plotly_chart(fig_hodl_comparison, use_container_width=True)
 
+        # Sharpe Ratio Comparison
+        st.subheader("Sharpe Ratio Comparison")
+        fig_sharpe_comparison = px.bar(comparison_df, x='Leverage', y='Sharpe Ratio', 
+                                       title=f"Sharpe Ratio Comparison for Different Leverage ({token})")
+        st.plotly_chart(fig_sharpe_comparison, use_container_width=True)
+
     # Price Chart
     st.subheader("Price Chart")
     fig_price = go.Figure()
@@ -245,7 +309,7 @@ def main():
 
     # Display debug table
     st.subheader("Debug Table")
-    if results:  # Check if results list is not empty
+    if results:
         debug_df = results[0]['data'][['timestamp', 'close', 'fundingRate', 'hourly_fee', 'cumulative_hourly_fee', 'total_fee', 'price_change_pct', 'hourly_pnl', 'cumulative_pnl', 'account_balance']]
         
         # Add open and close fees to the debug table

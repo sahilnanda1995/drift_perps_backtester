@@ -57,39 +57,46 @@ def map_funding_rates_to_price(funding_rates, price_data):
     return mapped_data
 
 # Calculate fees and profits
-def calculate_fees_and_profits(mapped_data, position_size, leverage, margin_direction, token):
+def calculate_fees_and_profits(mapped_data, entry_amount, leverage, margin_direction, token):
     fee_discount = 0.25 if token in ['SOL', 'ETH', 'BTC'] else 1
-    open_fee = position_size * leverage * 0.001 * fee_discount
-    close_fee = position_size * leverage * 0.001 * fee_discount
+    initial_price = mapped_data['close'].iloc[0]
+    initial_token_amount = entry_amount / initial_price
 
-    mapped_data['hourly_fee'] = mapped_data['fundingRate'] * position_size * leverage
+    # Calculate open fee
+    open_fee = entry_amount * leverage * 0.001 * fee_discount
+    
+    # Calculate close fee (assuming it's the same as open fee)
+    close_fee = open_fee
+
+    # Calculate hourly fees based on current token price
+    mapped_data['hourly_fee'] = mapped_data['fundingRate'] * initial_token_amount * mapped_data['close'] * leverage
     if margin_direction == "Short":
         mapped_data['hourly_fee'] = -mapped_data['hourly_fee']
 
-    mapped_data['cumulative_fee'] = mapped_data['hourly_fee'].cumsum() + open_fee
-    
+    mapped_data['cumulative_hourly_fee'] = mapped_data['hourly_fee'].cumsum()
+    mapped_data['total_fee'] = mapped_data['cumulative_hourly_fee'] + open_fee
+
     mapped_data['price_change_pct'] = mapped_data['close'].pct_change()
-    mapped_data['hourly_pnl'] = position_size * leverage * mapped_data['price_change_pct']
+    mapped_data['hourly_pnl'] = entry_amount * leverage * mapped_data['price_change_pct']
     if margin_direction == "Short":
         mapped_data['hourly_pnl'] = -mapped_data['hourly_pnl']
     
     mapped_data['cumulative_pnl'] = mapped_data['hourly_pnl'].cumsum()
-    mapped_data['account_balance'] = position_size + mapped_data['cumulative_pnl'] - mapped_data['cumulative_fee']
+    mapped_data['account_balance'] = entry_amount + mapped_data['cumulative_pnl'] - mapped_data['total_fee']
 
     # Calculate HODL profit
-    initial_price = mapped_data['close'].iloc[0]
     final_price = mapped_data['close'].iloc[-1]
-    hodl_profit = position_size * (final_price - initial_price) / initial_price
+    hodl_profit = entry_amount * (final_price - initial_price) / initial_price
 
-    return mapped_data, hodl_profit
+    return mapped_data, hodl_profit, open_fee, close_fee
 
 # Create fee chart
 def create_fee_chart(mapped_data):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=mapped_data['timestamp'], y=mapped_data['cumulative_fee'],
-                             mode='lines', name='Cumulative Fees'))
-    fig.update_layout(title='Cumulative Fees Over Time',
-                      xaxis_title='Time', yaxis_title='Cumulative Fees (USD)')
+    fig.add_trace(go.Scatter(x=mapped_data['timestamp'], y=mapped_data['total_fee'],
+                             mode='lines', name='Total Fees'))
+    fig.update_layout(title='Total Fees Over Time',
+                      xaxis_title='Time', yaxis_title='Total Fees (USD)')
     return fig
 
 # Create hourly fee chart
@@ -115,9 +122,15 @@ def main():
     # Sidebar inputs
     token = st.sidebar.selectbox("Select Token", ["SOL", "BTC", "ETH"])
     margin_direction = st.sidebar.radio("Margin Direction", ["Long", "Short"])
-    start_date = st.sidebar.date_input("Start Date", date(2024, 6, 18))
-    end_date = st.sidebar.date_input("End Date", date(2024, 7, 18))
-    position_size = st.sidebar.number_input("Position Size (USD)", min_value=100, value=1000, step=100)
+    
+    # Calculate default date range
+    end_date = date.today()
+    start_date = end_date - timedelta(days=14)  # 15 days ago (14 days difference)
+    
+    # Date inputs with new defaults
+    start_date = st.sidebar.date_input("Start Date", value=start_date)
+    end_date = st.sidebar.date_input("End Date", value=end_date)
+    entry_amount = st.sidebar.number_input("Entry Amount (USD)", min_value=100, value=1000, step=100)
 
     # Leverage options
     leverage_options = [1.5, 2, 3, 4, 5, 6, 8, 10]
@@ -138,30 +151,24 @@ def main():
     # Calculate fees and profits for each leverage
     results = []
     for leverage in selected_leverages:
-        data, hodl_profit = calculate_fees_and_profits(mapped_data.copy(), position_size, leverage, margin_direction, token)
+        data, hodl_profit, open_fee, close_fee = calculate_fees_and_profits(mapped_data.copy(), entry_amount, leverage, margin_direction, token)
         results.append({
             'leverage': leverage,
             'data': data,
-            'hodl_profit': hodl_profit
+            'hodl_profit': hodl_profit,
+            'open_fee': open_fee,
+            'close_fee': close_fee
         })
-
-    # Display debug table
-    st.subheader("Debug Table")
-    if results:  # Check if results list is not empty
-        debug_df = results[0]['data'][['timestamp', 'close', 'fundingRate', 'hourly_fee', 'cumulative_fee', 'price_change_pct', 'hourly_pnl', 'cumulative_pnl', 'account_balance']]
-        st.dataframe(debug_df)
-    else:
-        st.write("No data to display. Please select at least one leverage option.")
 
     # Create and display new charts
     if results:  # Check if results list is not empty
         st.subheader("Fee Analysis")
         fee_chart = go.Figure()
         for result in results:
-            fee_chart.add_trace(go.Scatter(x=result['data']['timestamp'], y=result['data']['cumulative_fee'],
+            fee_chart.add_trace(go.Scatter(x=result['data']['timestamp'], y=result['data']['total_fee'],
                                            mode='lines', name=f'{result["leverage"]}x Leverage'))
-        fee_chart.update_layout(title='Cumulative Fees Over Time',
-                                xaxis_title='Time', yaxis_title='Cumulative Fees (USD)')
+        fee_chart.update_layout(title='Total Fees Over Time',
+                                xaxis_title='Time', yaxis_title='Total Fees (USD)')
         st.plotly_chart(fee_chart, use_container_width=True)
 
         st.subheader("Hourly Fee Analysis")
@@ -194,9 +201,9 @@ def main():
         for result in results:
             leverage = result['leverage']
             data = result['data']
-            total_fee = data['cumulative_fee'].iloc[-1]
+            total_fee = data['total_fee'].iloc[-1]
             final_balance = data['account_balance'].iloc[-1]
-            profit = final_balance - position_size
+            profit = final_balance - entry_amount
 
             comparison_data.append({
                 'Leverage': f'{leverage}x',
@@ -235,6 +242,22 @@ def main():
                                        name='Price'))
     fig_price.update_layout(title=f"{token} Price", xaxis_title="Date", yaxis_title="Price (USD)")
     st.plotly_chart(fig_price, use_container_width=True)
+
+    # Display debug table
+    st.subheader("Debug Table")
+    if results:  # Check if results list is not empty
+        debug_df = results[0]['data'][['timestamp', 'close', 'fundingRate', 'hourly_fee', 'cumulative_hourly_fee', 'total_fee', 'price_change_pct', 'hourly_pnl', 'cumulative_pnl', 'account_balance']]
+        
+        # Add open and close fees to the debug table
+        debug_df['open_fee'] = results[0]['open_fee']
+        debug_df['close_fee'] = results[0]['close_fee']
+        
+        # Reorder columns for better readability
+        debug_df = debug_df[['timestamp', 'close', 'fundingRate', 'open_fee', 'hourly_fee', 'close_fee', 'cumulative_hourly_fee', 'total_fee', 'price_change_pct', 'hourly_pnl', 'cumulative_pnl', 'account_balance']]
+        
+        st.dataframe(debug_df)
+    else:
+        st.write("No data to display. Please select at least one leverage option.")
 
 if __name__ == "__main__":
     main()
